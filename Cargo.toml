@@ -1,0 +1,16 @@
+[package]
+name = "rbd_dimmer"
+version = "0.1.0"
+authors = ["Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.66"
+description = "Rewrite RBDDimmer for Rust. Tested on ESP32"
+homepage = "https://github.com/emeric-martineau/rbd_dimmer"
+keywords = ["embedded", "RBDDimmer", "Esp32"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/emeric-martineau/rbd_dimmer"
+
+[dependencies]
+embedded-hal = "0.2.7"
