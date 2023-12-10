@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::*;
+use crate::zc::*;
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 enum PinState {

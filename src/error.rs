@@ -12,6 +12,14 @@ pub enum RbdDimmerErrorKind {
     ChannelCommunicationDisconnected,
     /// Unknow error
     Other,
+    /// Timer cancel error
+    TimerCancel,
+    /// Timer is scheduled
+    TimerScheduled,
+    /// Timer every
+    TimerEvery,
+    /// No dimmer found with ID
+    DimmerNotFound,
 }
 
 /// Uart error with type and message
@@ -23,7 +31,6 @@ pub struct RbdDimmerError {
 
 impl fmt::Display for RbdDimmerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO
         write!(
             f,
             "Error when use RBDDimmer interface. Reason: {}",

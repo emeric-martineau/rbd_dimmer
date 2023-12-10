@@ -2,174 +2,237 @@
 //!
 //! RBDDimmer of [RoboDyn](https://robotdyn.fr.aliexpress.com) is device build around two triac.
 //!
-//! This crate not works like official library. Power is turn on/off on Zero Crossing event if device has MOC3021 triac to limit power-lost.
+//! This crate works like official library.
 //!
+//! You create a dimmer and set a % of time of full power.
+//! Device use MOC3021 triac to limit power-lost.
+//!
+use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
+use esp_idf_hal::task::block_on;
+use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
+use std::time::Duration;
+
 use crate::error::*;
-use std::sync::mpsc::{self, TryRecvError};
-use std::sync::mpsc::{Receiver, Sender};
 
 pub mod error;
-#[cfg(test)]
-mod tests;
+pub mod zc;
 
-/// Abstract output pin
-pub trait OutputPin {
-    /// Set the output as high
-    fn set_high(&mut self) -> Result<(), RbdDimmerError>;
+/// Output pin (dimmer).
+pub type OutputPin = PinDriver<'static, AnyOutputPin, Output>;
+/// Input pin (zero crossing).
+pub type InputPin = PinDriver<'static, AnyInputPin, Input>;
 
-    /// Set the output as low
-    fn set_low(&mut self) -> Result<(), RbdDimmerError>;
+/// This enum represent the frequency electricity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frequency {
+    /// Voltage has 50Hz frequency (like Europe).
+    F50HZ,
+    /// Voltage haz 60Hz frequency (like U.K.).
+    F60HZ,
 }
 
-/// Struct to manage power of dimmer device
-pub struct DimmerDevice<O>
-where
-    O: OutputPin,
-{
+/// Struct to manage power of dimmer device.
+pub struct DimmerDevice {
     id: u8,
-    pin: O,
-    power: u8,
+    pin: OutputPin,
+    invert_power: u8,
 }
 
-impl<O> DimmerDevice<O>
-where
-    O: OutputPin,
-{
-    /// Create new struct
-    pub fn new(id: u8, pin: O) -> Self {
-        DimmerDevice { id, pin, power: 0 }
+impl DimmerDevice {
+    /// Create new struct.
+    pub fn new(id: u8, pin: OutputPin) -> Self {
+        DimmerDevice {
+            id,
+            pin,
+            invert_power: 100,
+        }
     }
 
-    /// Set power of device. Power is percent
+    /// Set power of device. Power is percent of time of half sinusoidal (not of power).
     pub fn set_power(&mut self, p: u8) {
-        self.power = p;
+        // It's easy to turn on triac but hard to turn off when voltage > 0.
+        // Triac automatically turn off when voltage = 0.
+        // At first time of half sinusoidal, we keep off triac and turn on after.
+        // That why, we invert power.
+        self.invert_power = 100 - p;
     }
 
-    /// Value of tick increase by zero crossing interrupt
+    /// Value of tick increase by ISR interrupt. Frequency depends on frequency electricity.
     pub fn tick(&mut self, t: u8) -> Result<(), RbdDimmerError> {
-        // If power percent is over, shutdown pin
-        if t > self.power {
-            return self.pin.set_low();
+        // If power percent is mower, shutdown pin
+        if t >= self.invert_power {
+            return match self.pin.set_high() {
+                Ok(_) => Ok(()),
+                Err(_) => Err(RbdDimmerError::from(RbdDimmerErrorKind::SetLow)),
+            };
         }
 
-        self.pin.set_high()
+        match self.pin.set_low() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(RbdDimmerError::from(RbdDimmerErrorKind::SetHigh)),
+        }
     }
-
-    pub fn pin(&mut self) -> &O {
-        &self.pin
-    }
 }
 
-/// Struct to communicate with DevicesDimmerManager
-#[derive(Debug)]
-pub struct DevicesDimmerManagerNotification {
-    /// Id of device
-    pub id: u8,
-    /// New power value
-    pub power: u8,
-}
-
-/// Zero crossing pin abstract
-pub trait ZeroCrossingPin {
-    /// Wait for rising
-    fn wait_for_rising_edge(&mut self) -> Result<(), RbdDimmerError>;
-}
-
-pub struct DevicesDimmerManager<O, ZC>
-where
-    O: OutputPin,
-    ZC: ZeroCrossingPin,
-{
-    // Devices to manage
-    devices: Vec<DimmerDevice<O>>,
+/// Manager of dimmer and timer. This is a singleton.
+pub struct DevicesDimmerManager {
     // Pin to know if Zero Crossing
-    zero_crossing_pin: ZC,
-    // Channel to communicate with thread
-    tx_power_change: Sender<DevicesDimmerManagerNotification>,
-    rx_power_change: Receiver<DevicesDimmerManagerNotification>,
-    // Current counter of zero crossing
-    counter: u8,
+    zero_crossing_pin: InputPin,
+    // Timer frequency
+    frequency: Duration,
 }
 
-impl<O, ZC> DevicesDimmerManager<O, ZC>
-where
-    O: OutputPin,
-    ZC: ZeroCrossingPin,
-{
-    pub fn new(zero_crossing_pin: ZC) -> Self {
-        let (tx_power_change, rx_power_change): (
-            Sender<DevicesDimmerManagerNotification>,
-            Receiver<DevicesDimmerManagerNotification>,
-        ) = mpsc::channel();
-
-        Self {
-            devices: vec![],
-            zero_crossing_pin,
-            tx_power_change,
-            rx_power_change,
-            counter: 1,
+impl DevicesDimmerManager {
+    /// At first time, init the manager singleton. Else, return singleton already created.
+    /// The list of device is singleton.
+    pub fn init(
+        zero_crossing_pin: InputPin,
+        devices: Vec<DimmerDevice>,
+        frequency: Frequency,
+    ) -> &'static mut Self {
+        unsafe {
+            match DEVICES_DIMMER_MANAGER.as_mut() {
+                None => Self::initialize(zero_crossing_pin, devices, frequency),
+                Some(d) => d,
+            }
         }
     }
 
+    /// This function wait zero crossing. Zero crossing is low to high impulsion.
     pub fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
-        if self.read_power_update_message().is_err() {
-            return Err(RbdDimmerError::from(
-                RbdDimmerErrorKind::ChannelCommunicationDisconnected,
-            ));
-        }
+        let result = block_on(self.zero_crossing_pin.wait_for_rising_edge());
 
-        let result = self.zero_crossing_pin.wait_for_rising_edge();
+        unsafe {
+            let esp_timer = ESP_TIMER.as_ref().unwrap();
 
-        self.call_all_dimmer(self.counter);
+            match esp_timer.is_scheduled() {
+                Ok(true) => match cancel_timer(esp_timer) {
+                    Ok(value) => value,
+                    Err(value) => return value,
+                },
+                Ok(false) => false,
+                Err(e) => {
+                    return Err(RbdDimmerError::other(format!(
+                        "Cannot know if timer is scheduled, code {}",
+                        e
+                    )))
+                }
+            };
 
-        self.counter += 1;
-
-        if self.counter > 100 {
-            self.counter = 1;
-        }
-
-        result
-    }
-
-    pub fn sender(&mut self) -> Sender<DevicesDimmerManagerNotification> {
-        self.tx_power_change.clone()
-    }
-
-    pub fn add(&mut self, device: DimmerDevice<O>) {
-        self.devices.push(device);
-    }
-
-    // For each message in channel.
-    // We update dimmer until channel is empty.
-    // If channel is close, exit.
-    fn read_power_update_message(&mut self) -> Result<(), TryRecvError> {
-        loop {
-            match self.rx_power_change.try_recv() {
-                Ok(data) => self.update_dimmer_power(data),
-                Err(TryRecvError::Disconnected) => return Err(TryRecvError::Disconnected),
-                Err(TryRecvError::Empty) => break,
+            match esp_timer.every(self.frequency) {
+                Ok(()) => (),
+                Err(e) => {
+                    return Err(RbdDimmerError::other(format!(
+                        "Cannot schedule timer, code {}",
+                        e
+                    )))
+                }
             }
         }
 
-        Ok(())
-    }
-
-    // Update one dimmer power
-    fn update_dimmer_power(&mut self, data: DevicesDimmerManagerNotification) {
-        match self.devices.iter_mut().find(|d| d.id == data.id) {
-            None => {}
-            Some(device) => device.set_power(data.power),
+        match result {
+            Ok(_) => Ok(()),
+            Err(_) => Err(RbdDimmerError::other(String::from(
+                "Fail to wait signal on Zero Cross pin",
+            ))),
         }
     }
 
-    // Call all dimmer with tick
-    fn call_all_dimmer(&mut self, counter: u8) {
-        for dimmer in self.devices.iter_mut() {
-            // TODO ignore error?
-            let _ = dimmer.tick(counter);
+    /// Set power of a device. The list of device is singleton.
+    pub fn set_power(id: u8, power: u8) -> Result<(), RbdDimmerError> {
+        unsafe {
+            match DIMMER_DEVICES.iter_mut().find(|d| d.id == id) {
+                None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerNotFound)),
+                Some(device) => {
+                    device.set_power(power);
+                    Ok(())
+                },
+            }
         }
     }
 
-    // TODO remove()?
-    // TODO stop()?
+    fn initialize(
+        zero_crossing_pin: InputPin,
+        devices: Vec<DimmerDevice>,
+        frequency: Frequency,
+    ) -> &'static mut Self {
+        unsafe {
+            // Copy all devices
+            for d in devices {
+                DIMMER_DEVICES.push(d);
+            }
+
+            // Initialize
+            TICK = 0;
+
+            ESP_TIMER_SERVICE = Some(EspISRTimerService::new().unwrap());
+
+            let callback = || {
+                if TICK >= TICK_MAX {
+                    // If half period of sinusoidal is done, stop this timer
+                    let _ = ESP_TIMER.as_ref().unwrap().cancel();
+                    TICK = 0;
+                }
+
+                for d in DIMMER_DEVICES.iter_mut() {
+                    // TODO check error or not?
+                    let _ = d.tick(TICK);
+                }
+
+                TICK += 1;
+            };
+
+            ESP_TIMER = Some(ESP_TIMER_SERVICE.as_ref().unwrap().timer(callback).unwrap());
+
+            let f = match frequency {
+                Frequency::F50HZ => HZ_50_DURATION,
+                _ => HZ_60_DURATION,
+            };
+
+            // Create New device manager
+            DEVICES_DIMMER_MANAGER = Some(Self {
+                zero_crossing_pin,
+                frequency: f,
+            });
+
+            DEVICES_DIMMER_MANAGER.as_mut().unwrap()
+        }
+    }
 }
+
+fn cancel_timer(esp_timer: &EspTimer<'_>) -> Result<bool, Result<(), RbdDimmerError>> {
+    Ok(match esp_timer.cancel() {
+        Ok(true) => true,
+        Ok(false) => {
+            return Err(Err(RbdDimmerError::new(
+                RbdDimmerErrorKind::TimerCancel,
+                String::from("Cannot cancel timer. No reason given"),
+            )))
+        }
+        Err(e) => {
+            return Err(Err(RbdDimmerError::other(format!(
+                "Cannot stop timer, code {}",
+                e
+            ))))
+        }
+    })
+}
+
+// Duration of each percent cycle.
+// 50Hz => half sinusoidal / 100 = 0.1 ms
+const HZ_50_DURATION: Duration = Duration::from_micros(100);
+// 60Hz => half sinusoidal / 100 = 0.083 ms
+const HZ_60_DURATION: Duration = Duration::from_micros(83);
+
+// List of manager devices
+static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
+// Timer creator
+static mut ESP_TIMER_SERVICE: Option<EspISRTimerService> = None;
+// The timer that manager Triac
+static mut ESP_TIMER: Option<EspTimer<'static>> = None;
+// The device manager
+static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
+// Tick of device timer counter
+static mut TICK: u8 = 0;
+// Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
+const TICK_MAX: u8 = 98;
