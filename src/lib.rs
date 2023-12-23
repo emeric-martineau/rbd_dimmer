@@ -7,6 +7,9 @@
 //! You create a dimmer and set a % of time of full power.
 //! Device use MOC3021 triac to limit power-lost.
 //!
+//! You can use `zc` sub-module that manage % by using half sinusoidal.
+//! The `zc` sub-module works only for 50Hz voltage.
+//! 50Hz = 100 half sinusoidal per seconde => 100%
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
