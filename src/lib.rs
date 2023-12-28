@@ -13,6 +13,7 @@
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
+use core::fmt;
 use std::time::Duration;
 
 use crate::error::*;
@@ -32,6 +33,16 @@ pub enum Frequency {
     F50HZ,
     /// Voltage haz 60Hz frequency (like U.K.).
     F60HZ,
+}
+
+// Similarly, implement `Display` for `Point2D`.
+impl fmt::Display for Frequency {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Frequency::F50HZ => write!(f, "50Hz"),
+            _ => write!(f, "60Hz"),
+        }
+    }
 }
 
 /// Struct to manage power of dimmer device.
@@ -64,25 +75,28 @@ impl DimmerDevice {
     pub fn tick(&mut self, t: u8) -> Result<(), RbdDimmerError> {
         // If power percent is mower, shutdown pin
         if t >= self.invert_power {
-            return match self.pin.set_high() {
+            match self.pin.set_high() {
                 Ok(_) => Ok(()),
                 Err(_) => Err(RbdDimmerError::from(RbdDimmerErrorKind::SetLow)),
-            };
+            }
+        } else {
+            match self.pin.set_low() {
+                Ok(_) => Ok(()),
+                Err(_) => Err(RbdDimmerError::from(RbdDimmerErrorKind::SetHigh)),
+            }
         }
+    }
 
-        match self.pin.set_low() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(RbdDimmerError::from(RbdDimmerErrorKind::SetHigh)),
-        }
+    /// Reset pin to low.
+    pub fn reset(&mut self) {
+        let _ = self.pin.set_low();
     }
 }
 
 /// Manager of dimmer and timer. This is a singleton.
 pub struct DevicesDimmerManager {
     // Pin to know if Zero Crossing
-    zero_crossing_pin: InputPin,
-    // Timer frequency
-    frequency: Duration,
+    zero_crossing_pin: InputPin
 }
 
 impl DevicesDimmerManager {
@@ -105,36 +119,13 @@ impl DevicesDimmerManager {
     pub fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
         let result = block_on(self.zero_crossing_pin.wait_for_rising_edge());
 
-        unsafe {
-            let esp_timer = ESP_TIMER.as_ref().unwrap();
-
-            match esp_timer.is_scheduled() {
-                Ok(true) => match cancel_timer(esp_timer) {
-                    Ok(value) => value,
-                    Err(value) => return value,
-                },
-                Ok(false) => false,
-                Err(e) => {
-                    return Err(RbdDimmerError::other(format!(
-                        "Cannot know if timer is scheduled, code {}",
-                        e
-                    )))
-                }
-            };
-
-            match esp_timer.every(self.frequency) {
-                Ok(()) => (),
-                Err(e) => {
-                    return Err(RbdDimmerError::other(format!(
-                        "Cannot schedule timer, code {}",
-                        e
-                    )))
-                }
-            }
-        }
-
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                unsafe {
+                    IS_ZERO_CROSSING = true;
+                }
+                Ok(())
+            },
             Err(_) => Err(RbdDimmerError::other(String::from(
                 "Fail to wait signal on Zero Cross pin",
             ))),
@@ -165,24 +156,26 @@ impl DevicesDimmerManager {
                 DIMMER_DEVICES.push(d);
             }
 
-            // Initialize
-            TICK = 0;
-
             ESP_TIMER_SERVICE = Some(EspISRTimerService::new().unwrap());
 
             let callback = || {
-                if TICK >= TICK_MAX {
-                    // If half period of sinusoidal is done, stop this timer
-                    let _ = ESP_TIMER.as_ref().unwrap().cancel();
+                if TICK > TICK_MAX {
+                    IS_ZERO_CROSSING = false;
                     TICK = 0;
+
+                    for d in DIMMER_DEVICES.iter_mut() {
+                        d.reset();
+                    }
                 }
 
-                for d in DIMMER_DEVICES.iter_mut() {
-                    // TODO check error or not?
-                    let _ = d.tick(TICK);
+                if IS_ZERO_CROSSING {
+                    for d in DIMMER_DEVICES.iter_mut() {
+                        // TODO check error or not?
+                        let _ = d.tick(TICK);
+                    }
+    
+                    TICK += 1;
                 }
-
-                TICK += 1;
             };
 
             ESP_TIMER = Some(ESP_TIMER_SERVICE.as_ref().unwrap().timer(callback).unwrap());
@@ -192,33 +185,16 @@ impl DevicesDimmerManager {
                 _ => HZ_60_DURATION,
             };
 
+            let _ = ESP_TIMER.as_ref().unwrap().every(f);
+
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
-                zero_crossing_pin,
-                frequency: f,
+                zero_crossing_pin
             });
 
             DEVICES_DIMMER_MANAGER.as_mut().unwrap()
         }
     }
-}
-
-fn cancel_timer(esp_timer: &EspTimer<'_>) -> Result<bool, Result<(), RbdDimmerError>> {
-    Ok(match esp_timer.cancel() {
-        Ok(true) => true,
-        Ok(false) => {
-            return Err(Err(RbdDimmerError::new(
-                RbdDimmerErrorKind::TimerCancel,
-                String::from("Cannot cancel timer. No reason given"),
-            )))
-        }
-        Err(e) => {
-            return Err(Err(RbdDimmerError::other(format!(
-                "Cannot stop timer, code {}",
-                e
-            ))))
-        }
-    })
 }
 
 // Duration of each percent cycle.
@@ -227,6 +203,7 @@ const HZ_50_DURATION: Duration = Duration::from_micros(100);
 // 60Hz => half sinusoidal / 100 = 0.083 ms
 const HZ_60_DURATION: Duration = Duration::from_micros(83);
 
+static mut IS_ZERO_CROSSING: bool = false;
 // List of manager devices
 static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
 // Timer creator
@@ -238,4 +215,4 @@ static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
 // Tick of device timer counter
 static mut TICK: u8 = 0;
 // Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
-const TICK_MAX: u8 = 98;
+const TICK_MAX: u8 = 99;
