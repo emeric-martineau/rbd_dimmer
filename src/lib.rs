@@ -10,10 +10,10 @@
 //! You can use `zc` sub-module that manage % by using half sinusoidal.
 //! The `zc` sub-module works only for 50Hz voltage.
 //! 50Hz = 100 half sinusoidal per seconde => 100%
+use core::fmt;
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
-use core::fmt;
 use std::time::Duration;
 
 use crate::error::*;
@@ -100,7 +100,7 @@ pub struct DevicesDimmerManager {
     // Pin to know if Zero Crossing
     zero_crossing_pin: InputPin,
     // The timer that manager Triac
-    esp_timer: EspTimer<'static>
+    esp_timer: EspTimer<'static>,
 }
 
 impl DevicesDimmerManager {
@@ -130,10 +130,21 @@ impl DevicesDimmerManager {
                     IS_ZERO_CROSSING = true;
                 }
                 Ok(())
-            },
+            }
             Err(_) => Err(RbdDimmerError::other(String::from(
                 "Fail to wait signal on Zero Cross pin",
             ))),
+        }
+    }
+
+    /// Stop timer
+    pub fn stop(&mut self) -> Result<bool, RbdDimmerError> {
+        match self.esp_timer.cancel() {
+            Ok(status) => Ok(status),
+            Err(e) => Err(RbdDimmerError::new(
+                RbdDimmerErrorKind::TimerCancel,
+                format!("Fail to stop timer. Error code: {}", e),
+            )),
         }
     }
 
@@ -145,7 +156,7 @@ impl DevicesDimmerManager {
                 Some(device) => {
                     device.set_power(power);
                     Ok(())
-                },
+                }
             }
         }
     }
@@ -166,7 +177,7 @@ impl DevicesDimmerManager {
                     if TICK > TICK_MAX {
                         IS_ZERO_CROSSING = false;
                         TICK = 0;
-    
+
                         for d in DIMMER_DEVICES.iter_mut() {
                             d.reset();
                         }
@@ -175,7 +186,7 @@ impl DevicesDimmerManager {
                             // TODO check error or not?
                             let _ = d.tick(TICK);
                         }
-        
+
                         TICK += 1;
                     }
                 }
@@ -195,7 +206,7 @@ impl DevicesDimmerManager {
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
                 zero_crossing_pin,
-                esp_timer
+                esp_timer,
             });
 
             DEVICES_DIMMER_MANAGER.as_mut().unwrap()
@@ -208,7 +219,7 @@ impl DevicesDimmerManager {
 const HZ_50_DURATION: Duration = Duration::from_micros(100);
 // 60Hz => half sinusoidal / 100 = 0.083 ms
 const HZ_60_DURATION: Duration = Duration::from_micros(83);
-
+// IS_ZERO_CROSSING is use to know if zero crossing is detected
 static mut IS_ZERO_CROSSING: bool = false;
 // List of manager devices
 static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
