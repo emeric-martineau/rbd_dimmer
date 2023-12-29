@@ -72,6 +72,7 @@ impl DimmerDevice {
     }
 
     /// Value of tick increase by ISR interrupt. Frequency depends on frequency electricity.
+    #[inline(always)]
     pub fn tick(&mut self, t: u8) -> Result<(), RbdDimmerError> {
         // If power percent is mower, shutdown pin
         if t >= self.invert_power {
@@ -88,6 +89,7 @@ impl DimmerDevice {
     }
 
     /// Reset pin to low.
+    #[inline(always)]
     pub fn reset(&mut self) {
         let _ = self.pin.set_low();
     }
@@ -96,7 +98,9 @@ impl DimmerDevice {
 /// Manager of dimmer and timer. This is a singleton.
 pub struct DevicesDimmerManager {
     // Pin to know if Zero Crossing
-    zero_crossing_pin: InputPin
+    zero_crossing_pin: InputPin,
+    // The timer that manager Triac
+    esp_timer: EspTimer<'static>
 }
 
 impl DevicesDimmerManager {
@@ -116,6 +120,7 @@ impl DevicesDimmerManager {
     }
 
     /// This function wait zero crossing. Zero crossing is low to high impulsion.
+    #[inline(always)]
     pub fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
         let result = block_on(self.zero_crossing_pin.wait_for_rising_edge());
 
@@ -156,40 +161,41 @@ impl DevicesDimmerManager {
                 DIMMER_DEVICES.push(d);
             }
 
-            ESP_TIMER_SERVICE = Some(EspISRTimerService::new().unwrap());
-
             let callback = || {
-                if TICK > TICK_MAX {
-                    IS_ZERO_CROSSING = false;
-                    TICK = 0;
-
-                    for d in DIMMER_DEVICES.iter_mut() {
-                        d.reset();
-                    }
-                }
-
                 if IS_ZERO_CROSSING {
-                    for d in DIMMER_DEVICES.iter_mut() {
-                        // TODO check error or not?
-                        let _ = d.tick(TICK);
-                    }
+                    if TICK > TICK_MAX {
+                        IS_ZERO_CROSSING = false;
+                        TICK = 0;
     
-                    TICK += 1;
+                        for d in DIMMER_DEVICES.iter_mut() {
+                            d.reset();
+                        }
+                    } else {
+                        for d in DIMMER_DEVICES.iter_mut() {
+                            // TODO check error or not?
+                            let _ = d.tick(TICK);
+                        }
+        
+                        TICK += 1;
+                    }
                 }
             };
 
-            ESP_TIMER = Some(ESP_TIMER_SERVICE.as_ref().unwrap().timer(callback).unwrap());
+            // Timer creator
+            let esp_timer_service = EspISRTimerService::new().unwrap(); //TODO check error
+            let esp_timer = esp_timer_service.timer(callback).unwrap(); //TODO check error
 
             let f = match frequency {
                 Frequency::F50HZ => HZ_50_DURATION,
                 _ => HZ_60_DURATION,
             };
 
-            let _ = ESP_TIMER.as_ref().unwrap().every(f);
+            let _ = esp_timer.every(f); //TODO check error
 
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
-                zero_crossing_pin
+                zero_crossing_pin,
+                esp_timer
             });
 
             DEVICES_DIMMER_MANAGER.as_mut().unwrap()
@@ -206,13 +212,10 @@ const HZ_60_DURATION: Duration = Duration::from_micros(83);
 static mut IS_ZERO_CROSSING: bool = false;
 // List of manager devices
 static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
-// Timer creator
-static mut ESP_TIMER_SERVICE: Option<EspISRTimerService> = None;
-// The timer that manager Triac
-static mut ESP_TIMER: Option<EspTimer<'static>> = None;
+
 // The device manager
 static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
 // Tick of device timer counter
 static mut TICK: u8 = 0;
 // Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
-const TICK_MAX: u8 = 99;
+const TICK_MAX: u8 = 98;
