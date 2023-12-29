@@ -14,6 +14,7 @@ use core::fmt;
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
+use esp_idf_sys::EspError;
 use std::time::Duration;
 
 use crate::error::*;
@@ -110,11 +111,17 @@ impl DevicesDimmerManager {
         zero_crossing_pin: InputPin,
         devices: Vec<DimmerDevice>,
         frequency: Frequency,
-    ) -> &'static mut Self {
+    ) -> Result<&'static mut Self, RbdDimmerError> {
         unsafe {
             match DEVICES_DIMMER_MANAGER.as_mut() {
-                None => Self::initialize(zero_crossing_pin, devices, frequency),
-                Some(d) => d,
+                None => match Self::initialize(zero_crossing_pin, devices, frequency) {
+                    Ok(d) => Ok(d),
+                    Err(e) => Err(RbdDimmerError::new(
+                        RbdDimmerErrorKind::Other,
+                        format!("Fail to initialize timer. Error code: {}", e),
+                    )),
+                },
+                Some(d) => Ok(d),
             }
         }
     }
@@ -165,7 +172,7 @@ impl DevicesDimmerManager {
         zero_crossing_pin: InputPin,
         devices: Vec<DimmerDevice>,
         frequency: Frequency,
-    ) -> &'static mut Self {
+    ) -> Result<&'static mut Self, EspError> {
         unsafe {
             // Copy all devices
             for d in devices {
@@ -193,15 +200,15 @@ impl DevicesDimmerManager {
             };
 
             // Timer creator
-            let esp_timer_service = EspISRTimerService::new().unwrap(); //TODO check error
-            let esp_timer = esp_timer_service.timer(callback).unwrap(); //TODO check error
+            let esp_timer_service = EspISRTimerService::new()?; //TODO check error
+            let esp_timer = esp_timer_service.timer(callback)?; //TODO check error
 
             let f = match frequency {
                 Frequency::F50HZ => HZ_50_DURATION,
                 _ => HZ_60_DURATION,
             };
 
-            let _ = esp_timer.every(f); //TODO check error
+            esp_timer.every(f)?; //TODO check error
 
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
@@ -209,7 +216,7 @@ impl DevicesDimmerManager {
                 esp_timer,
             });
 
-            DEVICES_DIMMER_MANAGER.as_mut().unwrap()
+            Ok(DEVICES_DIMMER_MANAGER.as_mut().unwrap())
         }
     }
 }
