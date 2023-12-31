@@ -15,6 +15,7 @@ use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
 use esp_idf_sys::EspError;
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use crate::error::*;
@@ -65,13 +66,12 @@ static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
 // The device manager
 static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
 // Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
-const TICK_MAX: u8 = 98;
+static mut TICK_MAX: u8 = 95;
 // Tick of device timer counter. TICK=0 means zero crossing detected.
 // If TICK=TICK_MAX, nothing happen.
-static mut TICK: u8 = TICK_MAX;
+static mut TICK: u8 = 0;
 // Step of tick
 static mut TICK_STEP: u8 = 1;
-
 
 /// Output pin (dimmer).
 pub type OutputPin = PinDriver<'static, AnyOutputPin, Output>;
@@ -147,6 +147,60 @@ impl DimmerDevice {
     }
 }
 
+/// Config of device manager
+pub struct DevicesDimmerManagerConfig {
+    /// Pin for read zero crossing
+    pub zero_crossing_pin: InputPin,
+    /// List of devices to manage
+    pub devices: Vec<DimmerDevice>,
+    /// Frequency of network (Europe = 50Hz)
+    pub frequency: Frequency,
+    /// Step of manage power. In 50Hz, by default, power is managed
+    /// every 0.1ms. But you can multiy by step_size.
+    /// That mean is step_size = 10, power management is every 1ms and
+    /// power tick is also multiply by 10 (power step wil by 0, 10, 20, 30...)
+    pub step_size: u8,
+    /// Tick max of power management in percent.
+    /// By default, you cannot set power more than 95%.
+    pub tick_max: u8,
+}
+
+impl DevicesDimmerManagerConfig {
+    pub fn default(
+        zero_crossing_pin: InputPin,
+        devices: Vec<DimmerDevice>,
+        frequency: Frequency,
+    ) -> Self {
+        Self {
+            zero_crossing_pin,
+            devices,
+            frequency,
+            step_size: 1,
+            tick_max: 95,
+        }
+    }
+
+    pub fn default_50_hz(zero_crossing_pin: InputPin, devices: Vec<DimmerDevice>) -> Self {
+        Self {
+            zero_crossing_pin,
+            devices,
+            frequency: Frequency::F50HZ,
+            step_size: 1,
+            tick_max: 95,
+        }
+    }
+
+    pub fn default_60_hz(zero_crossing_pin: InputPin, devices: Vec<DimmerDevice>) -> Self {
+        Self {
+            zero_crossing_pin,
+            devices,
+            frequency: Frequency::F60HZ,
+            step_size: 1,
+            tick_max: 95,
+        }
+    }
+}
+
 /// Manager of dimmer and timer. This is a singleton.
 pub struct DevicesDimmerManager {
     // Pin to know if Zero Crossing
@@ -158,12 +212,9 @@ pub struct DevicesDimmerManager {
 impl DevicesDimmerManager {
     /// At first time, init the manager singleton. Else, return singleton already created.
     /// The list of device is singleton.
-    pub fn init(
-        zero_crossing_pin: InputPin,
-        devices: Vec<DimmerDevice>,
-        frequency: Frequency,
-    ) -> Result<&'static mut Self, RbdDimmerError> {
-        Self::init_advanced(zero_crossing_pin, devices, frequency, 1)
+    /// Max power is 95%.
+    pub fn init(config: DevicesDimmerManagerConfig) -> Result<&'static mut Self, RbdDimmerError> {
+        Self::init_advanced(config)
     }
 
     /// At first time, init the manager singleton. Else, return singleton already created.
@@ -171,14 +222,14 @@ impl DevicesDimmerManager {
     /// step_size is allow to contol if power management is do 0 to 100 by step_size.
     /// That allow also to be create more time for ISR timer (in 50Hz always 0.1ms * step size ).
     pub fn init_advanced(
-        zero_crossing_pin: InputPin,
-        devices: Vec<DimmerDevice>,
-        frequency: Frequency,
-        step_size: u8,
+        config: DevicesDimmerManagerConfig,
     ) -> Result<&'static mut Self, RbdDimmerError> {
         unsafe {
+            TICK_MAX = config.tick_max;
+            TICK = TICK_MAX;
+
             match DEVICES_DIMMER_MANAGER.as_mut() {
-                None => match Self::initialize(zero_crossing_pin, devices, frequency, step_size) {
+                None => match Self::initialize(config) {
                     Ok(d) => Ok(d),
                     Err(e) => Err(RbdDimmerError::new(
                         RbdDimmerErrorKind::Other,
@@ -198,10 +249,6 @@ impl DevicesDimmerManager {
         match result {
             Ok(_) => {
                 unsafe {
-                    for d in DIMMER_DEVICES.iter_mut() {
-                        d.reset();
-                    }
-
                     TICK = 0;
                 }
                 Ok(())
@@ -227,49 +274,50 @@ impl DevicesDimmerManager {
         }
     }
 
-    fn initialize(
-        zero_crossing_pin: InputPin,
-        devices: Vec<DimmerDevice>,
-        frequency: Frequency,
-        step_size: u8,
-    ) -> Result<&'static mut Self, EspError> {
+    fn initialize(config: DevicesDimmerManagerConfig) -> Result<&'static mut Self, EspError> {
         unsafe {
             // Copy all devices
-            for d in devices {
+            for d in config.devices {
                 DIMMER_DEVICES.push(d);
             }
 
-            TICK_STEP = step_size;
+            TICK_STEP = config.step_size;
 
             let callback = || {
-                if TICK < TICK_MAX {
-                    for d in DIMMER_DEVICES.iter_mut() {
-                        // TODO check error or not?
-                        let _ = d.tick(TICK);
+                match TICK.cmp(&TICK_MAX) {
+                    Ordering::Less => {
+                        for d in DIMMER_DEVICES.iter_mut() {
+                            // TODO check error or not?
+                            let _ = d.tick(TICK);
+                        }
+
+                        TICK += TICK_STEP;
                     }
-                    
-                    TICK += TICK_STEP;
-                } else if TICK == TICK_MAX {
-                    for d in DIMMER_DEVICES.iter_mut() {
-                        d.reset();
+                    Ordering::Greater => {}
+                    Ordering::Equal => {
+                        for d in DIMMER_DEVICES.iter_mut() {
+                            d.reset();
+                        }
                     }
-                }
+                };
             };
 
             // Timer creator
             let esp_timer_service = EspISRTimerService::new()?;
             let esp_timer = esp_timer_service.timer(callback)?;
 
-            let f = match frequency {
+            let f = match config.frequency {
                 Frequency::F50HZ => HZ_50_DURATION,
                 _ => HZ_60_DURATION,
             };
 
-            esp_timer.every(Duration::from_micros((f as u64) * (step_size as u64)))?;
+            esp_timer.every(Duration::from_micros(
+                (f as u64) * (config.step_size as u64),
+            ))?;
 
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
-                zero_crossing_pin,
+                zero_crossing_pin: config.zero_crossing_pin,
                 esp_timer,
             });
 
