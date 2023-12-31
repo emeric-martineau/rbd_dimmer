@@ -22,6 +22,57 @@ use crate::error::*;
 pub mod error;
 pub mod zc;
 
+//---------------------------------------------------------------------------------------
+// Explanation of the internal workings
+// ====================================
+//
+// An item on AC network have a global power characteristic. This power is not instant
+// power. This power is P= U.I.cos φ.
+// Where:
+//  - U = Umax / √2
+//  - I = Imax / √2
+// That mean, if you cut voltage on half of half sinusoidal. Item use only 50% of
+// official power.
+//
+// To do that, we use a triac MOC2031 and we turn on this triac only we it's necessary.
+//
+// To do that, we need detect the zero crossing and use timer to cut half sinusoidal in
+// 100.
+//
+// In 50Hz, we have only 10ms for one half sinusoidal! That mean, each part of 100 has
+// only 0.1ms!!!
+//
+// In this case, we need do the job very quicly. And to do that, Rust is not really
+// helpfull :)
+// We need use ISR timer. That mean we cannot have context. We need use static global
+// variable.
+//
+// The ISR timer is always on.
+// When zero crossing is detected, we set IS_ZERO_CROSSING to true.
+// When IS_ZERO_CROSSING is true, ISR timer increase TICK from 0 to TICK_MAX (normaly
+// 100 but in this case, we have collision with zero crossing detection).
+// The ISR timer call `tick()` method of each dimmer.
+//---------------------------------------------------------------------------------------
+
+// Duration of each percent cycle.
+// 50Hz => half sinusoidal / 100 = 0.1 ms
+const HZ_50_DURATION: u8 = 100;
+// 60Hz => half sinusoidal / 100 = 0.083 ms
+const HZ_60_DURATION: u8 = 83;
+// List of manager devices
+static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
+
+// The device manager
+static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
+// Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
+const TICK_MAX: u8 = 98;
+// Tick of device timer counter. TICK=0 means zero crossing detected.
+// If TICK=TICK_MAX, nothing happen.
+static mut TICK: u8 = TICK_MAX;
+// Step of tick
+static mut TICK_STEP: u8 = 1;
+
+
 /// Output pin (dimmer).
 pub type OutputPin = PinDriver<'static, AnyOutputPin, Output>;
 /// Input pin (zero crossing).
@@ -112,9 +163,22 @@ impl DevicesDimmerManager {
         devices: Vec<DimmerDevice>,
         frequency: Frequency,
     ) -> Result<&'static mut Self, RbdDimmerError> {
+        Self::init_advanced(zero_crossing_pin, devices, frequency, 1)
+    }
+
+    /// At first time, init the manager singleton. Else, return singleton already created.
+    /// The list of device is singleton.
+    /// step_size is allow to contol if power management is do 0 to 100 by step_size.
+    /// That allow also to be create more time for ISR timer (in 50Hz always 0.1ms * step size ).
+    pub fn init_advanced(
+        zero_crossing_pin: InputPin,
+        devices: Vec<DimmerDevice>,
+        frequency: Frequency,
+        step_size: u8,
+    ) -> Result<&'static mut Self, RbdDimmerError> {
         unsafe {
             match DEVICES_DIMMER_MANAGER.as_mut() {
-                None => match Self::initialize(zero_crossing_pin, devices, frequency) {
+                None => match Self::initialize(zero_crossing_pin, devices, frequency, step_size) {
                     Ok(d) => Ok(d),
                     Err(e) => Err(RbdDimmerError::new(
                         RbdDimmerErrorKind::Other,
@@ -129,12 +193,16 @@ impl DevicesDimmerManager {
     /// This function wait zero crossing. Zero crossing is low to high impulsion.
     #[inline(always)]
     pub fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
-        let result = block_on(self.zero_crossing_pin.wait_for_rising_edge());
+        let result = block_on(self.zero_crossing_pin.wait_for_falling_edge());
 
         match result {
             Ok(_) => {
                 unsafe {
-                    IS_ZERO_CROSSING = true;
+                    for d in DIMMER_DEVICES.iter_mut() {
+                        d.reset();
+                    }
+
+                    TICK = 0;
                 }
                 Ok(())
             }
@@ -146,6 +214,10 @@ impl DevicesDimmerManager {
 
     /// Stop timer
     pub fn stop(&mut self) -> Result<bool, RbdDimmerError> {
+        unsafe {
+            TICK = TICK_MAX;
+        }
+
         match self.esp_timer.cancel() {
             Ok(status) => Ok(status),
             Err(e) => Err(RbdDimmerError::new(
@@ -155,23 +227,11 @@ impl DevicesDimmerManager {
         }
     }
 
-    /// Set power of a device. The list of device is singleton.
-    pub fn set_power(id: u8, power: u8) -> Result<(), RbdDimmerError> {
-        unsafe {
-            match DIMMER_DEVICES.iter_mut().find(|d| d.id == id) {
-                None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerNotFound)),
-                Some(device) => {
-                    device.set_power(power);
-                    Ok(())
-                }
-            }
-        }
-    }
-
     fn initialize(
         zero_crossing_pin: InputPin,
         devices: Vec<DimmerDevice>,
         frequency: Frequency,
+        step_size: u8,
     ) -> Result<&'static mut Self, EspError> {
         unsafe {
             // Copy all devices
@@ -179,36 +239,33 @@ impl DevicesDimmerManager {
                 DIMMER_DEVICES.push(d);
             }
 
+            TICK_STEP = step_size;
+
             let callback = || {
-                if IS_ZERO_CROSSING {
-                    if TICK > TICK_MAX {
-                        IS_ZERO_CROSSING = false;
-                        TICK = 0;
-
-                        for d in DIMMER_DEVICES.iter_mut() {
-                            d.reset();
-                        }
-                    } else {
-                        for d in DIMMER_DEVICES.iter_mut() {
-                            // TODO check error or not?
-                            let _ = d.tick(TICK);
-                        }
-
-                        TICK += 1;
+                if TICK < TICK_MAX {
+                    for d in DIMMER_DEVICES.iter_mut() {
+                        // TODO check error or not?
+                        let _ = d.tick(TICK);
+                    }
+                    
+                    TICK += TICK_STEP;
+                } else if TICK == TICK_MAX {
+                    for d in DIMMER_DEVICES.iter_mut() {
+                        d.reset();
                     }
                 }
             };
 
             // Timer creator
-            let esp_timer_service = EspISRTimerService::new()?; //TODO check error
-            let esp_timer = esp_timer_service.timer(callback)?; //TODO check error
+            let esp_timer_service = EspISRTimerService::new()?;
+            let esp_timer = esp_timer_service.timer(callback)?;
 
             let f = match frequency {
                 Frequency::F50HZ => HZ_50_DURATION,
                 _ => HZ_60_DURATION,
             };
 
-            esp_timer.every(f)?; //TODO check error
+            esp_timer.every(Duration::from_micros((f as u64) * (step_size as u64)))?;
 
             // Create New device manager
             DEVICES_DIMMER_MANAGER = Some(Self {
@@ -221,19 +278,15 @@ impl DevicesDimmerManager {
     }
 }
 
-// Duration of each percent cycle.
-// 50Hz => half sinusoidal / 100 = 0.1 ms
-const HZ_50_DURATION: Duration = Duration::from_micros(100);
-// 60Hz => half sinusoidal / 100 = 0.083 ms
-const HZ_60_DURATION: Duration = Duration::from_micros(83);
-// IS_ZERO_CROSSING is use to know if zero crossing is detected
-static mut IS_ZERO_CROSSING: bool = false;
-// List of manager devices
-static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
-
-// The device manager
-static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
-// Tick of device timer counter
-static mut TICK: u8 = 0;
-// Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
-const TICK_MAX: u8 = 98;
+/// Set power of a device. The list of device is singleton.
+pub fn set_power(id: u8, power: u8) -> Result<(), RbdDimmerError> {
+    unsafe {
+        match DIMMER_DEVICES.iter_mut().find(|d| d.id == id) {
+            None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerNotFound)),
+            Some(device) => {
+                device.set_power(power);
+                Ok(())
+            }
+        }
+    }
+}
