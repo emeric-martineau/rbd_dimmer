@@ -23,7 +23,7 @@ unsafe {
     d.set_power(10);
 
     // Create Power management
-    let ddm = DevicesDimmerManager::init(zero_crossing_pin, vec![d], rbd_dimmer::Frequency::F50HZ);
+    let ddm = DevicesDimmerManager::init(DevicesDimmerManagerConfig::default_50_hz(zero_crossing_pin, vec![d])).unwrap();
 
     loop {
         let _ = ddm.wait_zero_crossing();
@@ -124,6 +124,10 @@ pub fn new<'a>(
     devices_dimmer_manager
 }
 ```
+
+# More information
+
+Read [How it works?](doc/HOW-IT-WORKS.md) for more information.
 
 ## License
 
