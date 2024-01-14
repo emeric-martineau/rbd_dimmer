@@ -143,7 +143,10 @@ impl DimmerDevice {
     /// Reset pin to low.
     #[inline(always)]
     pub fn reset(&mut self) {
-        let _ = self.pin.set_low();
+        // In case of we have 100% of power, we never reset.
+        if self.invert_power > 0 {
+            let _ = self.pin.set_low();
+        }
     }
 }
 

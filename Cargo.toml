@@ -1,6 +1,6 @@
 [package]
 name = "rbd_dimmer"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>"]
 edition = "2021"
 resolver = "2"
