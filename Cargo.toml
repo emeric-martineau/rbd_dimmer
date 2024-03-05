@@ -1,6 +1,6 @@
 [package]
 name = "rbd_dimmer"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Emeric Martineau <11473190+emeric-martineau@users.noreply.github.com>"]
 edition = "2021"
 resolver = "2"
@@ -32,14 +32,14 @@ hal = ["esp-idf-hal", "embedded-svc", "esp-idf-svc"]
 #nightly = ["embedded-svc?/nightly", "esp-idf-svc?/nightly"] # Future: "esp-idf-hal?/nightly"
 
 [dependencies]
-log = { version = "0.4.17", default-features = false }
-esp-idf-sys = { version = "0.33.7", default-features = false }
-esp-idf-hal = { version = "0.42.5", optional = true, default-features = false }
-esp-idf-svc = { version = "0.47.3", optional = true, default-features = false }
-embedded-svc = { version = "0.26.4", optional = true, default-features = false }
-embedded-hal = "0.2.7"
+log = { version = ">=0.4.17", default-features = false }
+esp-idf-sys = { version = ">=0.33.7", default-features = false }
+esp-idf-hal = { version = ">=0.42.5", optional = true, default-features = false }
+esp-idf-svc = { version = ">=0.47.3", optional = true, default-features = false }
+embedded-svc = { version = ">=0.26.4", optional = true, default-features = false }
+embedded-hal = ">=0.2.7"
 liquidcrystal_i2c-rs = "0.1.0"
-edge-executor = "0.4.0"
+edge-executor = ">=0.4.0"
 
 [build-dependencies]
-embuild = "0.31.2"
+embuild = "0.31.4"

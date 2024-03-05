@@ -28,7 +28,6 @@ unsafe {
     loop {
         let _ = ddm.wait_zero_crossing();
     }
-    }
 ```
 
 That's all!
