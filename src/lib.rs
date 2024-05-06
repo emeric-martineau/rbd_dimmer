@@ -341,3 +341,13 @@ pub fn set_power(id: u8, power: u8) -> Result<(), RbdDimmerError> {
         }
     }
 }
+
+/// Stop manager.
+pub fn stop() -> Result<bool, RbdDimmerError> {
+    unsafe {
+        match DEVICES_DIMMER_MANAGER.as_mut() {
+            Some(d) => d.stop(),
+            None => Ok(true)
+        }
+    }
+}
