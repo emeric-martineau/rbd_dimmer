@@ -11,11 +11,13 @@
 //! The `zc` sub-module works only for 50Hz voltage.
 //! 50Hz = 100 half sinusoidal per seconde => 100%
 use core::fmt;
+use std::cell::RefCell;
 use esp_idf_hal::gpio::{AnyInputPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_hal::task::block_on;
 use esp_idf_svc::timer::{EspISRTimerService, EspTimer};
 use esp_idf_sys::EspError;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering as aOrdering};
 use std::time::Duration;
 
 use crate::error::*;
@@ -60,23 +62,34 @@ pub mod zc;
 const HZ_50_DURATION: u8 = 100;
 // 60Hz => half sinusoidal / 100 = 0.083 ms
 const HZ_60_DURATION: u8 = 83;
-// List of manager devices
-static mut DIMMER_DEVICES: Vec<DimmerDevice> = vec![];
-
-// The device manager
-static mut DEVICES_DIMMER_MANAGER: Option<DevicesDimmerManager> = None;
 // Maximal tick value. Cannot work 100% because of the zero crossing detection timer on the same core.
-static mut TICK_MAX: u8 = 95;
+static TICK_MAX: AtomicU8 = AtomicU8::new(95);
 // Tick of device timer counter. TICK=0 means zero crossing detected.
 // If TICK=TICK_MAX, nothing happen.
-static mut TICK: u8 = 0;
+static TICK: AtomicU8 = AtomicU8::new(0);
 // Step of tick
-static mut TICK_STEP: u8 = 1;
+static TICK_STEP: AtomicU8 = AtomicU8::new(1);
 
 /// Output pin (dimmer).
 pub type OutputPin = PinDriver<'static, AnyOutputPin, Output>;
 /// Input pin (zero crossing).
 pub type InputPin = PinDriver<'static, AnyInputPin, Input>;
+
+struct GlobalDimmerManager {
+    // List of manager devices
+    devices: RefCell<Vec<DimmerDevice>>,
+    // The device manager
+    manager: RefCell<Option<DevicesDimmerManager>>,
+}
+
+unsafe impl Sync for GlobalDimmerManager {
+    
+}
+
+static GLOBAL_DIMMER_INSTANCE: GlobalDimmerManager = GlobalDimmerManager {
+    devices: RefCell::new(vec![]),
+    manager: RefCell::new(None),
+};
 
 /// This enum represent the frequency electricity.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +100,7 @@ pub enum Frequency {
     F60HZ,
 }
 
-// Similarly, implement `Display` for `Point2D`.
+/// Similarly, implement `Display` for `Frequency`.
 impl fmt::Display for Frequency {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -148,6 +161,10 @@ impl DimmerDevice {
             let _ = self.pin.set_low();
         }
     }
+}
+
+unsafe impl Sync for DimmerDevice {
+
 }
 
 /// Config of device manager
@@ -213,47 +230,30 @@ pub struct DevicesDimmerManager {
 }
 
 impl DevicesDimmerManager {
-    /// At first time, init the manager singleton. Else, return singleton already created.
-    /// The list of device is singleton.
-    /// Max power is 95%.
-    pub fn init(config: DevicesDimmerManagerConfig) -> Result<&'static mut Self, RbdDimmerError> {
-        Self::init_advanced(config)
-    }
-
-    /// At first time, init the manager singleton. Else, return singleton already created.
-    /// The list of device is singleton.
-    /// step_size is allow to contol if power management is do 0 to 100 by step_size.
-    /// That allow also to be create more time for ISR timer (in 50Hz always 0.1ms * step size ).
-    pub fn init_advanced(
+    /// At first time, init the manager singleton.
+    pub fn init(
         config: DevicesDimmerManagerConfig,
-    ) -> Result<&'static mut Self, RbdDimmerError> {
-        unsafe {
-            TICK_MAX = config.tick_max;
-            TICK = TICK_MAX;
+    ) -> Result<(), RbdDimmerError> {
+        TICK_MAX.store(config.tick_max, aOrdering::Relaxed);
+        TICK.store(config.tick_max, aOrdering::Relaxed);
 
-            match DEVICES_DIMMER_MANAGER.as_mut() {
-                None => match Self::initialize(config) {
-                    Ok(d) => Ok(d),
-                    Err(e) => Err(RbdDimmerError::new(
-                        RbdDimmerErrorKind::Other,
-                        format!("Fail to initialize timer. Error code: {}", e),
-                    )),
-                },
-                Some(d) => Ok(d),
-            }
+        match Self::initialize(config) {
+            Ok(d) => Ok(d),
+            Err(e) => Err(RbdDimmerError::new(
+                RbdDimmerErrorKind::Other,
+                format!("Fail to initialize timer. Error code: {}", e),
+            )),
         }
     }
 
     /// This function wait zero crossing. Zero crossing is low to high impulsion.
     #[inline(always)]
-    pub fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
+    fn wait_zero_crossing(&mut self) -> Result<(), RbdDimmerError> {
         let result = block_on(self.zero_crossing_pin.wait_for_falling_edge());
 
         match result {
             Ok(_) => {
-                unsafe {
-                    TICK = 0;
-                }
+                TICK.store(0, aOrdering::Relaxed);
                 Ok(())
             }
             Err(_) => Err(RbdDimmerError::other(String::from(
@@ -263,10 +263,8 @@ impl DevicesDimmerManager {
     }
 
     /// Stop timer
-    pub fn stop(&mut self) -> Result<bool, RbdDimmerError> {
-        unsafe {
-            TICK = TICK_MAX;
-        }
+    fn stop(&self) -> Result<bool, RbdDimmerError> {
+        TICK.store(TICK_MAX.load(aOrdering::Relaxed), aOrdering::Relaxed);
 
         match self.esp_timer.cancel() {
             Ok(status) => Ok(status),
@@ -277,29 +275,47 @@ impl DevicesDimmerManager {
         }
     }
 
-    fn initialize(config: DevicesDimmerManagerConfig) -> Result<&'static mut Self, EspError> {
+    fn initialize(config: DevicesDimmerManagerConfig) -> Result<(), EspError> {
         unsafe {
-            // Copy all devices
-            for d in config.devices {
-                DIMMER_DEVICES.push(d);
-            }
+            {       
+                let mut devices = GLOBAL_DIMMER_INSTANCE.devices.borrow_mut();
 
-            TICK_STEP = config.step_size;
+                for d in config.devices {
+                    devices.push(d);
+                }
+            } // Borrom mut is release here
+
+            TICK_STEP.store(config.step_size, aOrdering::Relaxed);
 
             let callback = || {
-                match TICK.cmp(&TICK_MAX) {
+                let tick_max = TICK_MAX.load(aOrdering::Relaxed);
+                let tick = TICK.load(aOrdering::Relaxed);
+                match tick.cmp(&tick_max) {
                     Ordering::Less => {
-                        for d in DIMMER_DEVICES.iter_mut() {
-                            // TODO check error or not?
-                            let _ = d.tick(TICK);
+                        match GLOBAL_DIMMER_INSTANCE.devices.try_borrow_mut() {
+                            Ok(mut devices) => {
+                                for d in devices.iter_mut() {
+                                    // TODO check error or not?
+                                    let _ = d.tick(TICK.load(aOrdering::Relaxed));
+                                }
+                            },
+                            Err(_) => {},
                         }
 
-                        TICK += TICK_STEP;
+                        TICK.store(
+                            tick + TICK_STEP.load(aOrdering::Relaxed),
+                            aOrdering::Relaxed,
+                        );
                     }
                     Ordering::Greater => {}
                     Ordering::Equal => {
-                        for d in DIMMER_DEVICES.iter_mut() {
-                            d.reset();
+                        match GLOBAL_DIMMER_INSTANCE.devices.try_borrow_mut() {
+                            Ok(mut devices) => {
+                                for d in devices.iter_mut() {
+                                    d.reset();
+                                }
+                            },
+                            Err(_) => {},
                         }
                     }
                 };
@@ -319,35 +335,60 @@ impl DevicesDimmerManager {
             ))?;
 
             // Create New device manager
-            DEVICES_DIMMER_MANAGER = Some(Self {
+            let mut manager = GLOBAL_DIMMER_INSTANCE.manager.borrow_mut();
+
+            *manager = Some(Self {
                 zero_crossing_pin: config.zero_crossing_pin,
                 esp_timer,
             });
 
-            Ok(DEVICES_DIMMER_MANAGER.as_mut().unwrap())
+            Ok(())
         }
     }
 }
 
 /// Set power of a device. The list of device is singleton.
 pub fn set_power(id: u8, power: u8) -> Result<(), RbdDimmerError> {
-    unsafe {
-        match DIMMER_DEVICES.iter_mut().find(|d| d.id == id) {
-            None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerNotFound)),
-            Some(device) => {
-                device.set_power(power);
-                Ok(())
+    match GLOBAL_DIMMER_INSTANCE.devices.try_borrow_mut() {
+        Ok(mut devices) => {
+            match devices.iter_mut().find(|d| d.id == id) {
+                Some(device) => {
+                    device.set_power(power);
+                    Ok(())
+                },
+                None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerNotFound)),
             }
-        }
+        },
+        Err(_) => Ok(()),
     }
 }
 
 /// Stop manager.
 pub fn stop() -> Result<bool, RbdDimmerError> {
-    unsafe {
-        match DEVICES_DIMMER_MANAGER.as_mut() {
-            Some(d) => d.stop(),
-            None => Ok(true)
-        }
+    match GLOBAL_DIMMER_INSTANCE.manager.try_borrow_mut() {
+        Ok(mut manager) => {
+            match manager.as_mut() {
+                Some(d) => d.stop(),
+                None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerManagerNotInit)),
+            }
+        },
+        Err(_) => Ok(false),
+    }
+}
+
+pub fn wait_zero_crossing() ->  Result<bool, RbdDimmerError> {
+    match GLOBAL_DIMMER_INSTANCE.manager.try_borrow_mut() {
+        Ok(mut manager) => {
+            match manager.as_mut() {
+                Some(d) => {
+                    match d.wait_zero_crossing() {
+                        Ok(()) => Ok(true),
+                        Err(e) => Err(e),
+                    }
+                },
+                None => Err(RbdDimmerError::from(RbdDimmerErrorKind::DimmerManagerNotInit)),
+            }
+        },
+        Err(_) => Ok(false),
     }
 }
