@@ -52,9 +52,9 @@ pub mod zc;
 //
 // The ISR timer is always on.
 // When zero crossing is detected, we set IS_ZERO_CROSSING to true.
-// When IS_ZERO_CROSSING is true, ISR timer increase TICK from 0 to TICK_MAX (normaly
+// When IS_ZERO_CROSSING is true, ISR timer increase TICK from 0 to tick_max (normaly
 // 100 but in this case, we have collision with zero crossing detection).
-// The ISR timer call `tick()` method of each dimmer.
+// The ISR timer call `tick_manager()` method of each dimmer.
 //---------------------------------------------------------------------------------------
 
 // Duration of each percent cycle.
