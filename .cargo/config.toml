@@ -5,11 +5,14 @@ target = "xtensa-esp32-espidf"
 linker = "ldproxy"
 # runner = "espflash --monitor" # Select this runner for espflash v1.x.x
 runner = "espflash flash --monitor" # Select this runner for espflash v2.x.x
+#rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
 build-std = ["std", "panic_abort"]
 
 [env]
 # Note: these variables are not used when using pio builder (`cargo build --features pio`)
+#ESP_IDF_VERSION = "v5.2.1"
 ESP_IDF_VERSION = "v4.4.6"
+
 

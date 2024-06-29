@@ -13,6 +13,14 @@ You can visit [RobotDyn Official Store](https://robotdyn.fr.aliexpress.com/store
 
 This crate works only on ESP32-WROOM-32 (2016) microcontroler.
 
+## ESP SKK config
+
+You need add in your `sdkconfig.defaults` file (at root of your rust project):
+```
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+CONFIG_ESP_TIMER_INTERRUPT_LEVEL=1
+```
+
 ## Example
 
 ```rust
