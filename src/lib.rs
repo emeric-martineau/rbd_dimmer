@@ -307,7 +307,7 @@ impl DevicesDimmerManager {
                                 d.reset();
                             }
                         }
-                    },
+                    }
                 };
             };
 
