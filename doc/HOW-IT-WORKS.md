@@ -12,7 +12,7 @@ When you read the characteristics of a load, you see V=230V, In=10A, P=1800W for
 
 These values are not max values but RMS values. Max value is RMS value multiplied by square root of 2.
 
-## Theorie of manage
+## Theorie of management
 
 To manage power (for example, you want use 50%, 900W, in previous example), we will turn on power only on half sinusoidal.
 
