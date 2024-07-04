@@ -13,21 +13,32 @@ You can visit [RobotDyn Official Store](https://robotdyn.fr.aliexpress.com/store
 
 This crate works only on ESP32-WROOM-32 (2016) microcontroler.
 
+## ESP SKK config
+
+You need add in your `sdkconfig.defaults` file (at root of your rust project):
+```
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+CONFIG_ESP_TIMER_INTERRUPT_LEVEL=1
+```
+
 ## Example
 
 ```rust
 unsafe {
     let zero_crossing_pin: PinDriver<'static, AnyInputPin, Input> = PinDriver::input(AnyInputPin::new(2)).unwrap();
     let d0_pin: PinDriver<'static, AnyOutputPin, Output> = PinDriver::output(AnyOutputPin::new(4)).unwrap();
-    let mut d = DimmerDevice::new(0, d0_pin);
-    d.set_power(10);
+    let id: u8 = 0;
+    let d = DimmerDevice::new(id, d0_pin);
 
     // Create Power management
     let ddm = DevicesDimmerManager::init(DevicesDimmerManagerConfig::default_50_hz(zero_crossing_pin, vec![d])).unwrap();
 
+    rbd_dimmer::set_power(id, 100).unwrap();
+
     loop {
-        let _ = ddm.wait_zero_crossing();
+        rbd_dimmer::wait_zero_crossing().unwrap();
     }
+}
 ```
 
 That's all!

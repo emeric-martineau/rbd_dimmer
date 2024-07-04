@@ -20,6 +20,8 @@ pub enum RbdDimmerErrorKind {
     TimerEvery,
     /// No dimmer found with ID
     DimmerNotFound,
+    /// Not init
+    DimmerManagerNotInit,
 }
 
 /// Uart error with type and message
